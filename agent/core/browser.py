@@ -147,15 +147,15 @@ class Browser:
     async def wait_for_navigation_settle(self, timeout_s: float = 30.0) -> None:
         """导航/重定向后阶梯式等待落地，防过早返回，永不抛异常。
 
+        - **关键：导航等待期间只用 page.url 轮询，绝不调 aria_snapshot。**
+          实测在同一 goto 下，轮询期间调用 page.aria_snapshot() 会阻塞前端路由守卫，
+          导致重定向（如 #/home/chat/main → #/login）不发生；只用 page.url 则正常。
+          故此函数纯以 URL 变化判定，AX 快照留给后续步骤按需拍摄。
         - 轮询间隔阶梯递增：500ms→1s→2s，封顶 2s。快页面早退，慢页面不频繁打扰。
-          每次观测到状态变化时重置阶梯，让变化后的确认用短间隔快速完成。
-        - 稳定判定：URL 与 AX 哈希连续 2 轮一致。
-        - 防过早返回（核心）：以 **URL 是否变化** 判断重定向是否已发生。
-          · URL 已变化（重定向已发生）→ 连续 2 轮一致即返回；
-          · URL 自始未变（疑似重定向待发生，如登录页 3~5s 后才跳 /login）
-            → 必须等过 MIN_NO_REDIRECT_DWELL 且连续 2 轮一致才返回，
-              避免在中间页（邀请码页）渲染稳定后、重定向发生前误判稳定。
-          注：不能用 AX 哈希变化判断"重定向已发生"——中间页自身渲染也会变哈希。
+          观测到 URL 变化时重置阶梯，让变化后用短间隔快速确认。
+        - 稳定判定：URL 连续 2 轮一致。
+        - 防过早返回：URL 自始未变（疑似重定向待发生）时，至少观察 MIN_NO_REDIRECT_DWELL
+          且连续 2 轮一致才返回，避免在落地页稳定后、重定向前误判。
         - 超时即视为"等够了"返回（不抛），交给 verify 判定。
         """
         intervals = [0.5, 1.0, 2.0]  # 阶梯，最后一档循环
@@ -164,7 +164,6 @@ class Browser:
         start_time = time.time()
         first_url = None
         last_url = None
-        last_hash = ""
         stable_count = 0
         url_changed = False
         i = 0
@@ -173,17 +172,14 @@ class Browser:
         while time.time() < deadline:
             try:
                 url = self.page.url
-                ax_text = await self.get_page_state()
             except Exception:
                 url = ""
-                ax_text = ""
-            current_hash = hashlib.md5(ax_text.encode("utf-8")).hexdigest()
 
             if first_sample:
                 first_sample = False
                 first_url = url
-            elif url != last_url or current_hash != last_hash:
-                # 状态在变：重置稳定计数与阶梯间隔，变化后用短间隔快速确认
+            elif url != last_url:
+                # URL 在变：重置稳定计数与阶梯间隔，变化后用短间隔快速确认
                 stable_count = 0
                 i = 0
                 if url != first_url:
@@ -199,7 +195,6 @@ class Browser:
                         return
 
             last_url = url
-            last_hash = current_hash
             interval = intervals[min(i, len(intervals) - 1)]
             i += 1
             await self.page.wait_for_timeout(int(interval * 1000))

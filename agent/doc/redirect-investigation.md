@@ -1,181 +1,198 @@
-# 诊断报告：parse_case 的 LLM 网络调用干扰浏览器 goto 重定向
+# 诊断报告：完整 run_case 路径下 goto 后重定向不发生（根因未明，待外部 review）
 
-> 状态：实测确证现象与根因方向，但**底层机制未明**，待外部 review。
-> 整理日期：2026-06-27
-> 项目：`G:\cc_demos\web-ui-case-execute-agent`（Web UI 自动化测试执行 Agent，Python + Playwright）
-
----
-
-## 0. 一句话结论
-
-`run_case` 中「先 `parse_case`（内含 4 次 LLM 调用）→ 再 `page.goto()`」的顺序，会导致 goto 后页面**不重定向**到 `/login`，停在公共落地页；把两者顺序对调（先 goto 再 parse_case），重定向就正常。**现象确定性可复现，但「为什么 LLM 的 HTTP 调用会干扰随后一个全新浏览器 context 的导航」在逻辑上无法解释，需协助定位机制。**
+> 状态：**根因未锁定**。已通过大量对照实验排除多个假设，变量收窄到"调 `Agent.run()` 方法"本身，但无法解释机制。需外部 AI 协助。
+> 整理日期：2026-06-27（最新修订）
+> 项目：`G:\cc_demos\web-ui-case-execute-agent`（Web UI 自动化测试执行 Agent，Python 3.11 + Playwright，Windows 11）
 
 ---
 
-## 1. 现象
+## 0. 一句话现象
 
-被测站点起始 URL：
+被测起始 URL：
 ```
 https://tpt.supcon.com/tpt-app/#/home/chat/main?TptSaasUserTenantryId=ATL43NW8
 ```
-正常行为：浏览器打开该 URL 后，前端路由守卫在 **1.5~4.6s** 内重定向到 `https://tpt.supcon.com/tpt-app/#/login`（登录页，含 `textbox "请输入用户名"`、`textbox "请输入密码"`、`button "立即登录"`）。
+正常：`page.goto(start_url)` 后，前端路由守卫在 **1.5~5s** 内重定向到 `https://tpt.supcon.com/tpt-app/#/login`（登录页，AX 含 `textbox "请输入用户名"`）。
 
-异常行为：完整 agent 流程跑时，goto 后 URL 全程停在 `#/home/chat/main`，AX 快照首行为 `- text: 流程工业时序大模型TPT Time-series Pr...`（公共落地页，非登录页），**重定向从不发生**。于是第 1 步 grounding 找不到「请输入用户名」输入框，用例熔断。
+异常：**走完整 `run_case` → `Agent.run()` 路径时**，goto 后 URL 全程停在 `#/home/chat/main`，重定向**不发生**，AX 停在公共落地页（`- text: 流程工业时序大模型TPT...` + `textbox "请输入您的邀请码"`），grounding 找不到「请输入用户名」，用例熔断。
 
----
-
-## 2. 确定性差异（已实测复现）
-
-下列脚本共用同一段 `goto` + 轮询逻辑，唯一变量是**是否在 goto 之前调用 `parse_case`**。
-
-| 脚本 | goto 前是否跑 `parse_case` | 重定向到 /login | AX 首轮首行 |
-|---|---|---|---|
-| `_exp5.py`（5 轮连跑） | 否 | **5/5 成功** | `(empty)` 加载中 |
-| `_nav_debug.py` | 否 | 成功 | `(empty)` |
-| `_observe.py` | 否 | 成功（t=3s） | `(empty)` |
-| `_see_agent.py` | 是 | **失败** | `流程工业时序大模型TPT` 已渲染 |
-| `_no_snap.py` | 是 | **失败**（20s 不跳） | — |
-| 完整 agent（`run_case`） | 是 | **每次失败** | `流程工业时序大模型TPT` |
-| `_order_test.py`（先 goto 后 parse_case） | 否（goto 在前） | **成功** | `(empty)` |
-
-关键对照：
-- `_exp5`（无 parse_case）5 轮全成功；完整 agent（有 parse_case）每次全失败 —— **确定性，非随机**。
-- `_order_test` 把 parse_case 挪到 goto+重定向之后 —— 成功。**证明变量就是 parse_case 的执行时机，与浏览器 context、与等待逻辑、与 snapshot 都无关。**
+**关键：同一台机器、同一时刻、同样的 `page.goto(start_url)`，走 `Agent.run()` 就不重定向，走精简/复刻脚本就重定向。** 这是确定性的（多轮复现），但根因未明。
 
 ---
 
-## 3. 已排除的假设
+## 1. 已排除的假设（均有判别实验，勿再重复）
 
-| 假设 | 排除依据 |
-|---|---|
-| `aria_snapshot()` 打断重定向（CDP 通道争用） | `_no_snap.py`：nav 期间只轮询 `page.url`、绝不调 `aria_snapshot`，仍失败 |
-| 服务端租户态随机抖动 | 5 次连跑全成功 vs 全量每次全失败，是确定性的；服务端随机无法解释这种「按是否 parse_case 二分」的规律 |
-| `parse_case` 耗时（~9s）导致的纯时间延迟 | `_nav_debug.py` 加 `asyncio.sleep(15)` 模拟延迟，仍重定向成功 |
-| `wait_for_navigation_settle` 逻辑缺陷 | 该逻辑在「无 parse_case」场景下 5/5 正确抓到 1.5~4.6s 的重定向；且 `_no_snap` 不用该逻辑、纯轮询 URL 也失败 |
-| cookie / context 残留 | 每次 `browser.new_context()` 都是全新 context，无 cookie 复用 |
-
----
-
-## 4. 当前结论与未解的机制问题
-
-**已确证**：`parse_case` 在 goto 之前执行，是导致重定向失败的**充分且必要**条件。
-
-**`parse_case` 内部唯一的外部副作用**是 4 次 LLM 调用，经 `agent/core/llm.py` → `chat.py` → `openai.AsyncOpenAI`（httpx 异步客户端）。
-
-**未解的机制问题**（核心，需协助分析）：
-
-1. `openai.AsyncOpenAI` 的 LLM 调用与随后的 `page.goto()` 共用同一个 asyncio 事件循环。LLM 调用产生的 httpx 连接池 / 全局网络状态，**如何**影响一个全新 Playwright 浏览器 context 内部发起的 HTTP 请求（前端路由守卫的租户 token 校验请求）？
-2. 是否是 httpx 与 Playwright（底层 CDP over WebSocket）争用事件循环，导致浏览器侧某个 XHR/fetch 超时，前端路由守卫走了「停留落地页」分支而非「重定向 /login」分支？
-3. 还是 httpx 的全局 SSL 上下文 / DNS resolver / 代理设置污染了 Playwright 浏览器进程的网络栈？（注：Playwright 浏览器是独立子进程，理论上有独立网络栈，但 CDP 控制通道走宿主 loop。）
-4. openai-python / httpx 版本相关的已知 issue？
-
-**待验证的下一步实验**（未做）：
-- 用 `asyncio.run_in_executor` 或独立线程/子进程跑 LLM 调用，隔离事件循环，看是否恢复。
-- 给 `openai.AsyncOpenAI` 传入独立的 `httpx.AsyncClient`（独立 transport/连接池），看是否恢复。
-- 在 goto 期间抓浏览器网络日志（`page.on("request"/"response")`），对比有无 parse_case 时租户校验请求的差异。
+| 假设 | 证伪实验 | 结果 |
+|---|---|---|
+| 服务端会话/租户态失效导致 `/login` 渲染邀请码页 | `_observe.py`（goto start_url + 纯 wait_for_timeout 循环） | **重定向成功**，AX 是登录页。服务端正常。 |
+| 直接 `goto('/login')` 能到登录页 | `_see_login.py` / `_direct_login.py` | 直接 goto('/login') 渲染邀请码页（因不带租户上下文）；但从 start_url 重定向过去是登录页。**这不是 bug，是站点设计**。 |
+| `parse_case` 的 LLM 调用干扰 goto | `_ab_test.py`（同时刻 A 无 parse_case / B 有 parse_case） | A、B **都成功**。parse_case 不是变量。 |
+| httpx 资源累积泄漏（外部 AI 假设） | `_leak_test.py`（纯 chat.chat 1次/4次后 goto） | 1次、4次**都成功**。非累积泄漏。 |
+| `aria_snapshot()` 阻塞重定向 | `_url_repeat.py`（不调 snapshot 也失败）+ `_final_ab.py`（同时刻：精简脚本不调 snapshot 成功 / run_case 调 snapshot 失败） | snapshot 不是唯一变量；且 `wait_for_navigation_settle` 改为不调 snapshot 后 `run_case` 仍失败。 |
+| `wait_for_navigation_settle` 的阶梯/dwell 逻辑 | `_plain_nav.py`（run_case + 朴素 500ms 循环 nav，无阶梯无 dwell） | 仍失败。nav 等待逻辑不是变量。 |
+| `new_context(record_video_dir=None)` kwarg | `_ctx_test.py` V1(无kwarg)/V2(video=None) | V1、V2 **都成功**。kwarg 不是变量。 |
+| `Agent` 构造本身 | `_agent_ctor.py` B（构造 Agent 不调 run） | **成功**。Agent 构造不是变量。 |
+| `_emit("parse_done")` 在 goto 前调用 | `_emit_pos.py` C2（手动复刻 run 逻辑，含 emit 在 goto 前） | C2 **成功**。emit 本身不是变量。 |
 
 ---
 
-## 5. 涉及的模块与组件
+## 2. 当前收窄到的变量（核心未解问题）
 
-### 5.1 调用链
+**变量 = "调用真正的 `Agent.run()` 方法" vs "手动复刻等价的 run() 逻辑"。**
 
+`_agent_ctor.py` / `_emit_pos.py` 的对照（同一脚本内顺序跑，确定性）：
+
+| 变体 | 描述 | 结果 |
+|---|---|---|
+| A | 不构造 Agent，直接 goto + 朴素 nav | ✓ |
+| B | 构造 Agent，不调 run，直接 goto + 朴素 nav | ✓ |
+| C | 构造 Agent + **调 `agent.run()`**（nav_settle 被 patch 成朴素循环） | **✗** |
+| D | 构造 Agent + 手动复刻 run() 逻辑、**跳过 emit**、goto + 朴素 nav | ✓ |
+| C2 | 构造 Agent + 手动复刻 run() 逻辑、**含 emit**、goto + 朴素 nav | ✓ |
+| E | 构造 Agent + 手动复刻 run()、emit 放 goto 后 | ✓ |
+
+**C（调 `agent.run()`）失败，C2（手动复刻 run 的等价逻辑，含 emit）成功。** 两者代码上几乎等价，差别只在"调真正的 `agent.run()` 方法"vs"手动写等价代码"。
+
+### `Agent.run()` 源码（`agent/core/agent.py` L48-66）
+
+```python
+async def run(self) -> RunResult:
+    self._emit(
+        "parse_done", 0,
+        payload={
+            "case_name": self.case.name,
+            "total": len(self.case.steps),
+            "steps": [(s.index, s.raw_text[:60]) for s in self.case.steps],
+        },
+    )
+    report_path = ""
+    try:
+        await self.browser.page.goto(self.case.start_url, wait_until="domcontentloaded")
+        await self.browser.wait_for_navigation_settle()
+        for step in self.case.steps:
+            await self.execute_step(step)
+    ...
+```
+
+C2 手动复刻的就是这段（emit + goto + nav），但 C2 成功、C 失败。
+
+### 未解的机制问题（需外部 AI 回答）
+
+1. **调用 `Agent.run()` 方法本身，相比手动复刻其等价逻辑，会对随后 `page.goto()` 的浏览器重定向产生确定性影响吗？** 这种"调方法 vs 复刻代码"的差异通常不该存在——除非：
+   - `Agent` 是 `@dataclass`，`run` 是绑定方法，调用路径有差异？（不该影响浏览器）
+   - `self._emit` 是 `__post_init__` 里 `make_emitter` 创建的闭包，与 C2 的 `make_emit` 闭包有细微差别？（两者都调 `on_event(Event(...))`，on_event 都是 `lambda e: None`）
+   - 是否存在某种 `__post_init__` / dataclass 字段默认值在 `run()` 调用时才求值的副作用？
+
+2. C 失败时，nav_settle（被 patch 的朴素 500ms×10 循环）5s 内 URL 全程不变；C2 成功时 URL 在 3~4s 变到 /login。**同一个 `page.goto(start_url)`，重定向是否发生取决于调用方是 `agent.run()` 还是手写代码。** 浏览器进程是同一个，CDP 通道是同一个。
+
+3. 是否是 `agent.run()` 内部 `try/except/finally` 结构、或 `for step in self.case.steps` 在 goto 后立即进入 `execute_step`（调 `scroll_chat_to_bottom_if_exists` + `get_page_state`）导致？—— 但 C 失败发生在 nav_settle 阶段（goto 后、execute_step 前），URL 已确定没变。除非 nav_settle 的 patch 未生效。
+
+4. **patch 是否真的生效？** C 通过 `bm.Browser.wait_for_navigation_settle = _plain` patch 类方法，`agent.run()` 调 `self.browser.wait_for_navigation_settle()`。需确认 patch 后 `agent.run()` 走的是 `_plain` 还是原方法。若 patch 未生效，C 走的是原 `wait_for_navigation_settle`（含 aria_snapshot），那 C 失败就回到 snapshot 假设——但 `_final_ab.py` 已证明同时刻精简脚本调 snapshot 也成功……需厘清。
+
+---
+
+## 3. 关键文件与代码
+
+### 3.1 调用链
 ```
 agent/main.py  run 命令
   → agent/core/agent.py  run_case()
-      ①  raw_text = Path(case_file).read_text(...)
-      ②  case = await parse_case(raw_text)          ← 【根因所在】此处先跑 4 次 LLM
-      ③  async with async_playwright() as p:
-            browser = await p.chromium.launch(...)
-            context = await browser.new_context(...)
-            page = await context.new_page()
-      ④  await page.goto(case.start_url, ...)       ← 【受干扰】重定向不发生
-      ⑤  await browser.wait_for_navigation_settle()
-      ⑥  for step: await agent.execute_step(step)   ← 第 1 步 grounding 失败
+      raw = Path(case_file).read_text(...)
+      case = await parse_case(raw)              # 4 次 LLM，已证非变量
+      async with async_playwright() as p:
+          browser = await p.chromium.launch(headless=False)
+          context = await browser.new_context(viewport={...}, record_video_dir=None)
+          page = await context.new_page()
+          agent_browser = Browser(page, trace_dir=None)
+          agent = Agent(case=case, browser=agent_browser, on_event=on_event)
+          result = await agent.run()            # 【调此方法 = 失败】
+              → self._emit("parse_done", ...)   # goto 前
+              → await page.goto(start_url)      # 重定向不发生
+              → await self.browser.wait_for_navigation_settle()
+              → for step: execute_step(step)
 ```
 
-### 5.2 关键文件
-
-| 文件 | 角色 |
-|---|---|
-| `agent/core/agent.py` | `run_case()` 编排，**顺序①②→③④ 是问题所在**（见 L246-262） |
-| `agent/core/case_parser.py` | `parse_case()` → `_parse_single_step()` 每步调 1 次 LLM，4 步 = 4 次调用 |
-| `agent/core/llm.py` | `call_llm()` / `call_llm_with_prompt()`，加载 prompt 后调 `chat.chat()` |
-| `chat.py`（项目根） | 统一 LLM 封装，`chat()` 内部 `client = openai.AsyncOpenAI(api_key, base_url)` 然后 `await client.chat.completions.create(...)` |
-| `agent/core/browser.py` | `Browser.wait_for_navigation_settle()` 导航等待（已优化为阶梯式，但非根因） |
-| `agents_login_only.txt` | 触发用例（4 步登录+偏好设置） |
-| `config.local.json` | `model=MiniMax-M3`，`url=https://api.minimax.chat/v1` |
-
-### 5.3 LLM 调用细节（`chat.py` L207-231）
-
+### 3.2 `Agent` 类（`agent/core/agent.py` L27-46）
 ```python
-cfg = _MODELS[model]                       # MiniMax-M3
-client = openai.AsyncOpenAI(               # 每次调用 new 一个 client
-    api_key=api_key,
-    base_url=cfg["url"],                   # https://api.minimax.chat/v1
-)
-# extra_body 含 reasoning_split=True, thinking={type:disabled}
-completion = await client.chat.completions.create(
-    model=cfg["api"], messages=messages,
-    temperature=temperature, max_tokens=cfg["max_tokens"],
-    extra_body=extra_body or None,
-)
+@dataclass
+class Agent:
+    case: Case
+    browser: Browser
+    on_event: Callable[[Event], None] | None = None
+    records: list[StepRecord] = field(default_factory=list)
+    passed: int = 0
+    failed: int = 0
+    aborted: bool = False
+    abort_step: int | None = None
+    optimize_signals: list[OptimizationSignal] = field(default_factory=list)
+    exceptions: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        self._emit = make_emitter(self.on_event, total=len(self.case.steps))
+        self.grounding = Grounding()
+        self.verifier = Verifier()
 ```
-注意：`openai.AsyncOpenAI` 默认使用一个模块级/进程级 httpx 连接池与 SSL 上下文。`parse_case` 跑 4 次，每次 new 一个 client 但共享底层 httpx 全局状态。这是怀疑干扰源。
 
-### 5.4 浏览器侧（`agent/core/agent.py` L254-262）
-
+### 3.3 `make_emitter`（`agent/core/events.py`）
 ```python
-async with async_playwright() as p:
-    browser = await p.chromium.launch(headless=not headed)
-    context = await browser.new_context(viewport={"width":1280,"height":720})
-    page = await context.new_page()
-    agent_browser = Browser(page, ...)
-    agent = Agent(case=case, browser=agent_browser, on_event=on_event)
-    result = await agent.run()   # 内部 page.goto(start_url) + wait_for_navigation_settle
+def make_emitter(on_event, total):
+    if on_event is None:
+        def noop(type_, step_index, payload=None): pass
+        return noop
+    def emit(type_, step_index, payload=None):
+        on_event(Event(type=type_, step_index=step_index, total=total, payload=payload or {}))
+    return emit
 ```
-Playwright 的 CDP 控制通道（WebSocket）跑在同一个 asyncio 事件循环上。
 
-### 5.5 依赖版本（`requirements.txt`）
+### 3.4 `Browser.wait_for_navigation_settle`（`agent/core/browser.py`，当前版本已改为纯 URL 轮询不调 aria_snapshot）
+见仓库 `agent/core/browser.py` L147-201。
 
-```
-playwright
-openai
-typer
-```
-（未 pin 版本；实际环境 Python 3.11 / Windows 11）
+### 3.5 `run_case`（`agent/core/agent.py` L238-276）
+见仓库。
 
 ---
 
-## 6. 复现步骤
+## 4. 调试脚本（项目根目录，全部 headed）
 
-```bash
-cd G:\cc_demos\web-ui-case-execute-agent
-
-# 复现失败（先 parse_case 后 goto）：
-python _see_agent.py      # 或完整 agent：python _verify_run.py
-
-# 复现成功（先 goto 后 parse_case）：
-python _order_test.py
-
-# 复现成功（无 parse_case）：
-python _exp5.py           # 5 轮连跑
-```
-所有 `_*.py` 脚本均在项目根目录，headed 模式，会弹出浏览器窗口。文本日志打印每轮 URL 变化与 AX 首行。
-
----
-
-## 7. 待外部 AI 回答的问题
-
-1. 在同一 asyncio 事件循环里，先跑 `openai.AsyncOpenAI` 的 httpx 请求、再跑 Playwright `page.goto()`，是否存在已知的相互干扰机制？
-2. 若存在，是 httpx 全局状态（连接池/SSL/DNS）污染，还是事件循环争用导致 CDP 指令延迟，进而让浏览器侧某个有时间限制的路由守卫请求超时？
-3. 最小且治本的隔离方案是什么？（独立事件循环 / 独立 httpx client / 子进程 / `asyncio.run_in_executor`？）
-4. 是否需要抓 `page.on("request")` / `page.on("console")` 对比有无 parse_case 时浏览器侧网络请求差异，以锁定被干扰的具体请求？
+| 脚本 | 用途 | 关键结果 |
+|---|---|---|
+| `_observe.py` | goto start_url + 纯 wait_for_timeout 循环 15s，打印 url+ax | 重定向成功（t=3~4s）|
+| `_see_login.py` | 直接 goto('/login') 拍 AX | 渲染邀请码页（非 bug）|
+| `_leak_test.py` | 纯 chat.chat 1次/4次后 goto | 都成功（证伪泄漏说）|
+| `_ab_test.py` | 同时刻 A 无 parse_case / B 有 parse_case | 都成功（证伪 parse_case）|
+| `_final_ab.py` | 同时刻 精简脚本 / 完整 run_case | 精简✓ run_case✗ |
+| `_ctx_test.py` | V1无kwarg/V2 video=None/V3 完整Agent | V1✓ V2✓ V3✗ |
+| `_agent_ctor.py` | A无Agent/B不run/C调run/D跳过emit | A✓ B✓ C✗ D✓ |
+| `_emit_pos.py` | C2 emit前 / E emit后 | 都✓（证伪 emit 是变量）|
+| `_plain_nav.py` | run_case + 朴素500ms nav | ✗ |
+| `_verify_run.py` | 完整 run_case 带日志 | ✗ |
+| `_bisect_repeat.py` / `_url_repeat.py` | 连跑3次 | 曾出现3/3失败（疑似当时刻污染）|
 
 ---
 
-## 附：本次已完成的无关修复（供参考，非本问题）
+## 5. 待外部 AI 回答的核心问题
 
-- `browser.py` 等待逻辑改为阶梯式自适应（`wait_stable` 200→500→1000ms；`wait_for_navigation_settle` 500→1000→2000ms，URL 变化判重定向 + 5s 防过早返回窗口）。在「无 parse_case 干扰」场景下 5/5 稳定抓到重定向。
-- 新增显式等待：`Browser.wait_explicit(seconds)` + `perform_action` 的 wait 分支读 `Step.value` 作秒数强制等满；`agent/prompts/parse_step.md` 约定 wait 动作 value=秒数字符串。
+1. 在 Python + Playwright + asyncio 环境下，**调用一个 `@dataclass` 的 async 方法（`Agent.run()`），与手动复刻该方法的等价代码**，是否可能对随后 `page.goto()` 触发的浏览器重定向产生确定性影响？若可能，机制是什么？
+2. 第 2 节的 C vs C2 对照（调方法失败 / 复刻代码成功）是否暗示 `agent.run()` 内部有未被观察到的副作用？建议如何进一步插桩（例如打印 goto 前后精确时间戳、CDP 通信日志）定位？
+3. 是否需要确认 `_plain` patch 在 `agent.run()` 内真的生效？若未生效，C 走原 `wait_for_navigation_settle`，但当前版本该函数已不调 aria_snapshot，为何仍失败？
+4. 是否可能是 `Agent.run()` 的 `try/except/finally` + `for step in ...` 结构导致 goto 后事件循环调度顺序不同，使浏览器侧重定向请求被延迟到 nav_settle 之后才发起？如何验证？
+5. 给定治标优先：在 `run_case` 中 goto 后检测未到 `/login` 时 `page.reload()` 或重新 `goto(start_url)`，是否可靠？
+
+---
+
+## 6. 排查过程教训（供参考）
+
+1. **单次实验不足以定论。** 本例中"parse_case 是根因""snapshot 是根因""emit 是根因"都曾被"确定性"宣布，又被下一轮同时刻对照推翻。现象可能受跑的时刻/顺序影响，**必须用同一脚本内 A/B 同时刻对照**才能锁定变量。
+2. **"非确定性"假象常源于未控制的时序变量。** 早期 `_no_snap` 等实验跨时段跑，结果被误当确定性。
+3. **外部 AI 的精致因果链需可证伪实验检验。** 本例外部 AI 的"httpx 泄漏→IOCP→CDP 背压→V8 挂起"被一次 `_leak_test` 证伪。
+4. **grounding 失败时先 dump 页面 AX 全文**，确认页面真实内容，而非假设页面正确去怀疑定位逻辑。
+5. **不要用截图排查**（文本模型读不了 PNG），靠 AX 快照文本 + 事件日志。
+
+---
+
+## 附：本次已完成的无关代码改动（保留，非根因修复）
+
+- `browser.py` `wait_for_navigation_settle` 已改为纯 `page.url` 轮询、不调 `aria_snapshot`（阶梯间隔 500ms→1s→2s + 5s 防过早返回窗口）。
+- `browser.py` `wait_stable` 改阶梯式（200→500→1000ms）。
+- 新增 `Browser.wait_explicit(seconds)` + `perform_action` wait 分支读 `Step.value` 秒数 + `parse_step.md` 约定。
 - 单元测试 `python -m pytest agent/tests -v` → 16 passed。
