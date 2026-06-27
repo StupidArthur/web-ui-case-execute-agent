@@ -1,0 +1,17 @@
+[parse] case=完成用户登录 total=4
+
+=== 步骤 1/4 开始: action=fill target=『请输入用户名』输入框
+  [grounding] found=False ref=0 role= name= | Nonems | AX 树中仅存在 name 为『请输入您的邀请码』的 textbox，未找到 name 为『请输入用户名』的输入框
+  [warn] attempt 1 异常 GroundingError: 未找到目标: 『请输入用户名』输入框
+  [grounding] found=False ref=0 role= name= | Nonems | AX 树中仅存在名为'请输入您的邀请码'的 textbox，未找到名为'请输入用户名'的输入框
+  [warn] attempt 2 异常 GroundingError: 未找到目标: 『请输入用户名』输入框
+  [grounding] found=False ref=0 role= name= | Nonems | AX 树中只存在名称为『请输入您的邀请码』的 textbox，未找到名为『请输入用户名』的输入框
+  [warn] attempt 3 异常 GroundingError: 未找到目标: 『请输入用户名』输入框
+  [FAIL] GroundingError: 未找到目标: 『请输入用户名』输入框 | screenshot=G:\cc_demos\web-ui-case-execute-agent\screenshot_20260626_163708_592512.png
+
+=== FINISH: passed=0 failed=1 finished=False abort_step=1
+  report=G:\cc_demos\web-ui-case-execute-agent\test_record_完成用户登录_20260626_163708.json
+
+总耗时 20s
+RunResult: finished=False passed=0 failed=1 abort_step=1
+exceptions: ['在第1步异常中止: GroundingError: 未找到目标: 『请输入用户名』输入框']

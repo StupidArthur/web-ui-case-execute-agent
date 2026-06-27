@@ -1,0 +1,17 @@
+- text: TPT 一个大模型 工厂智运行
+- radiogroup "segmented control":
+  - radio "密码登录" [checked]
+  - text: 密码登录
+  - radio "验证码登录"
+  - text: 验证码登录
+- text: 
+- textbox "请输入用户名"
+- text: 
+- textbox "请输入密码"
+- img "eye-invisible"
+- checkbox
+- text: 勾选即表示您同意并接受隐私政策与服务协议
+- button "立即登录"
+- text: V2.0 版权所有 ©中控技术股份有限公司
+- img "国徽"
+- text: 浙公网安备33010802002206号 浙ICP备05002928号-1
